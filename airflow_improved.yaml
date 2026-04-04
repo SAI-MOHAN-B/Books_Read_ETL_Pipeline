@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Improved Airflow server for Books User ETL Pipeline backed by Postgres RDS
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access into the Airflow web server
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+  
+  S3BucketName:
+    Description: REQUIRED - A new S3 Bucket name. This bucket will be used for Books ETL pipeline data zones
+    Type: String
+    AllowedPattern: '.+'
+  
+  DBPassword:
+    Default: airflowpassword
+    NoEcho: 'true'
+    Description: Airflow database admin account password
+    Type: String
+    MinLength: '8'
+    MaxLength: '41'
+    AllowedPattern: '[a-zA-Z0-9]*'
+    ConstraintDescription: Must contain only alphanumeric characters
+  
+  RepositoryURL:
+    Description: Git repository URL for Books ETL Pipeline
+    Type: String
+    Default: 'https://github.com/your-username/books_user_etl_pipeline.git'
+  
+  DataGenerationRecords:
+    Description: Number of records to generate in fake data generator
+    Type: Number
+    Default: 50000
+    MinValue: 1000
+    MaxValue: 1000000
+
+# Mapping to find the Amazon Linux AMI in each region.
+Mappings:
+  RegionMap:
+    ap-south-2:
+      AMI: ami-0684f2e4891088847
+    us-east-1:
+      AMI: ami-0c55b159cbfafe1f0
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref 'KeyName'
+      SecurityGroups: [!Ref 'AirflowEC2SecurityGroup']
+      InstanceType: 'm4.xlarge'
+      IamInstanceProfile:
+        Ref: EC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-Server
+        - Key: Environment
+          Value: Production
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - AMI
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e  # Exit on any error
+          exec > >(tee /var/log/user-data.log|logger -t user-data ) 2>&1
+          
+          # Update system packages
+          yum update -y
+          
+          # Install CloudFormation helper scripts
+          echo "Installing aws-cfn-bootstrap..."
+          yum install -y aws-cfn-bootstrap
+          
+          # Run CloudFormation metadata
+          /opt/aws/bin/cfn-init -v -c install --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+          
+          # Install dependencies
+          yum install -y git python3 python3-pip gcc python3-devel
+          
+          # Create airflow directory
+          mkdir -p /root/airflow
+          cd /root/airflow
+          
+          # Clone the Books ETL Repository
+          echo "Cloning Books ETL Pipeline repository..."
+          git clone ${RepositoryURL} /tmp/books_etl
+          
+          # Copy DAGs and plugins to airflow directory
+          cp -r /tmp/books_etl/airflow/dags /root/airflow/
+          cp -r /tmp/books_etl/airflow/plugins /root/airflow/
+          cp /tmp/books_etl/src /root/airflow/src
+          
+          # Install Python packages
+          echo "Installing Apache Airflow and dependencies..."
+          export SLUGIFY_USES_TEXT_UNIDECODE=yes
+          pip3 install -U apache-airflow[postgres,crypto,sshtunnel]
+          
+          # Fix dependency issues
+          pip3 install --upgrade six MarkupSafe
+          pip3 install boto3 pyspark faker pandas
+          
+          # Update PATH
+          echo 'export PATH=/usr/local/bin:$PATH' >> /root/.bash_profile
+          source /root/.bash_profile
+          
+          # Initialize Airflow database
+          echo "Initializing Airflow metadata database..."
+          airflow initdb
+          
+          # Update Airflow configuration for PostgreSQL backend
+          echo "Configuring Airflow to use PostgreSQL backend..."
+          sed -i '/sql_alchemy_conn/s/^/#/g' /root/airflow/airflow.cfg
+          sed -i '/^#sql_alchemy_conn/a sql_alchemy_conn = postgresql://airflow:${DBPassword}@${DBInstance.Endpoint.Address}:${DBInstance.Endpoint.Port}/airflowdb' /root/airflow/airflow.cfg
+          
+          # Switch to LocalExecutor for parallel task execution
+          echo "Configuring LocalExecutor..."
+          sed -i '/executor = SequentialExecutor/s/^/#/g' /root/airflow/airflow.cfg
+          sed -i '/^#executor = SequentialExecutor/a executor = LocalExecutor' /root/airflow/airflow.cfg
+          
+          # Set parallelism
+          sed -i 's/^parallelism = .*/parallelism = 32/' /root/airflow/airflow.cfg
+          sed -i 's/^max_active_runs_per_dag = .*/max_active_runs_per_dag = 2/' /root/airflow/airflow.cfg
+          
+          # Re-initialize database with new configuration
+          airflow initdb
+          
+          # Update S3 bucket names in configuration files
+          echo "Updating S3 bucket configuration..."
+          sed -i "s/<landing-zone>/books-landing-zone/g" /root/airflow/src/config.cfg
+          sed -i "s/<working-zone>/books-working-zone/g" /root/airflow/src/config.cfg
+          sed -i "s/<processed-zone>/books-processed-zone/g" /root/airflow/src/config.cfg
+          sed -i "s/<s3-bucket-name>/${S3BucketName}/g" /root/airflow/src/config.cfg
+          
+          # Generate initial fake data
+          echo "Generating initial books data (${DataGenerationRecords} records)..."
+          cd /tmp/books_etl/goodreadsfaker
+          python3 generate_fake_data.py -n ${DataGenerationRecords}
+          
+          # Upload generated data to S3 landing zone
+          echo "Uploading data to S3 landing zone..."
+          aws s3 mb s3://${S3BucketName}/books-landing-zone --region ${AWS::Region} 2>/dev/null || true
+          aws s3 cp ~/GoodReadsData/fake s3://${S3BucketName}/books-landing-zone/ --recursive --region ${AWS::Region}
+          
+          # Create working and processed zone buckets
+          aws s3 mb s3://${S3BucketName}/books-working-zone --region ${AWS::Region} 2>/dev/null || true
+          aws s3 mb s3://${S3BucketName}/books-processed-zone --region ${AWS::Region} 2>/dev/null || true
+          
+          # Start Airflow services in background
+          echo "Starting Airflow scheduler and webserver..."
+          nohup airflow scheduler > /var/log/airflow-scheduler.log 2>&1 &
+          sleep 3
+          nohup airflow webserver -p 8080 > /var/log/airflow-webserver.log 2>&1 &
+          sleep 5
+          
+          # Signal CloudFormation that setup is complete
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource EC2Instance --region ${AWS::Region}
+          
+          echo "Airflow setup completed successfully!"
+          echo "Access Airflow UI at: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8080"
+
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          install:
+            - gcc
+        gcc:
+          packages:
+            yum:
+              gcc: []
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+    DependsOn:
+      - DBInstance
+      - AirflowEC2SecurityGroup
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBName: airflowdb
+      Engine: postgres
+      EngineVersion: '12.7'
+      MasterUsername: airflow
+      MasterUserPassword: !Ref 'DBPassword'
+      DBInstanceClass: db.t2.small
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBSecurityGroups:
+        - Ref: DBSecurityGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-Database
+
+  AirflowEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: BooksAirflowEC2SG
+      GroupDescription: Security group for Books Airflow EC2 instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: Airflow UI access
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-EC2-SG
+
+  AirflowEMRMasterEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: BooksAirflowEMRMasterSG
+      GroupDescription: Airflow EMR Master Security Group
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-EMR-Master-SG
+    DependsOn:
+      - AirflowEC2SecurityGroup
+
+  AirflowEMRMasterInboundRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: '8998'
+      ToPort: '8998'
+      SourceSecurityGroupName: !Ref 'AirflowEC2SecurityGroup'
+      GroupName: !Ref 'AirflowEMRMasterEC2SecurityGroup'
+      Description: Livy API access
+
+  AirflowEMRSlaveEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: BooksAirflowEMRSlaveSG
+      GroupDescription: Airflow EMR Slave Security Group
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-EMR-Slave-SG
+
+  DBSecurityGroup:
+    Type: AWS::RDS::DBSecurityGroup
+    Properties:
+      GroupDescription: Security group for Books Airflow RDS database
+      DBSecurityGroupIngress:
+        EC2SecurityGroupName:
+          Ref: AirflowEC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-DB-SG
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BooksAirflowInstanceRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonElasticMapReduceFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Tags:
+        - Key: Name
+          Value: Books-Airflow-Instance-Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: BooksAirflowInstanceProfile
+      Roles:
+        - Ref: EC2Role
+
+  EmrRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BooksEmrRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "elasticmapreduce.amazonaws.com"
+                - "s3.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonElasticMapReduceFullAccess
+      Tags:
+        - Key: Name
+          Value: Books-EMR-Role
+
+  EmrEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: BooksEmrEc2Role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Tags:
+        - Key: Name
+          Value: Books-EMR-EC2-Role
+
+  EmrEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: BooksEmrEc2InstanceProfile
+      Roles:
+        - Ref: EmrEc2Role
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketName: !Ref 'S3BucketName'
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: Books-ETL-Data-Bucket
+
+Outputs:
+  AirflowEC2PublicDNSName:
+    Description: Public DNS Name of the Airflow EC2 instance
+    Value: !Join ["", ["http://", !GetAtt EC2Instance.PublicDnsName, ":8080"]]
+    Export:
+      Name: !Sub "${AWS::StackName}-AirflowURL"
+  
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub "${AWS::StackName}-EC2InstanceId"
+  
+  DBInstanceEndpoint:
+    Description: RDS Database Endpoint
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::StackName}-DBEndpoint"
+  
+  S3BucketName:
+    Description: S3 Bucket for Books ETL Pipeline
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Bucket"
