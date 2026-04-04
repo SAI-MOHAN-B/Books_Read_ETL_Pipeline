@@ -13,6 +13,17 @@ Parameters:
     Type: String
     AllowedPattern: '.+'
   
+  LandingZoneName:
+    Type: String
+    Default: books-landing-zone
+  
+  WorkingZoneName:
+    Type: String
+    Default: books-working-zone
+  
+  ProcessedZoneName:
+    Type: String
+    Default: books-processed-zone
   DBPassword:
     Default: airflowpassword
     NoEcho: 'true'
@@ -86,12 +97,12 @@ Resources:
           
           # Clone the Books ETL Repository
           echo "Cloning Books ETL Pipeline repository..."
-          git clone ${RepositoryURL} /tmp/books_etl
+          https://github.com/SAI-MOHAN-B/Books_Read_ETL_Pipeline.git
           
           # Copy DAGs and plugins to airflow directory
-          cp -r /tmp/books_etl/airflow/dags /root/airflow/
-          cp -r /tmp/books_etl/airflow/plugins /root/airflow/
-          cp /tmp/books_etl/src /root/airflow/src
+          cp -r  Books_Read_ETL_Pipeline/airflow/dags /root/airflow/
+          cp -r  Books_Read_ETL_Pipeline/airflow/plugins /root/airflow/
+          cp -r  Books_Read_ETL_Pipeline/src /root/airflow/src
           
           # Install Python packages
           echo "Installing Apache Airflow and dependencies..."
